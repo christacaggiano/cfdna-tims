@@ -78,9 +78,9 @@ def make_covariates(meta):
     return cov_final
 
 def main():
-    meth_path = "merged_als_data/ucla_umi_uq_umi_redone.txt"
-    meta_path = "combined_metadata_redone.csv"
-    tissue_path = "ucla_cpg_sorted.bed"
+    meth_path = "input_data.txt"
+    meta_path = "metadata.csv"
+    tissue_path = "sites.bed"
 
     outdir = "lasso_als_binary"
     os.makedirs(outdir, exist_ok=True)
