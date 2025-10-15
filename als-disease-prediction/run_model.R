@@ -8,23 +8,23 @@ suppressPackageStartupMessages({
 
 # ------------------------- Config -------------------------
 
-ucla_meth_path <- "ucla.txt"
-uq_meth_path   <- "uq.txt"
-ucla_cov_path  <- "ucla_covariates.txt"
-uq_cov_path    <- "uq_covariates.txt"
-meta_path      <- "metadata_final.txt"
+ucla_meth_path <- "lasso_als_binary/ucla_scaled.txt"
+uq_meth_path   <- "lasso_als_binary/uq_scaled.txt"
+ucla_cov_path  <- "lasso_als_binary/ucla_covariates.txt"
+uq_cov_path    <- "lasso_als_binary/uq_covariates.txt"
+meta_path      <- "lasso_als_binary/metadata_final.txt"
 
 manual_remove <- c("45", "96", "109")
 
-covars_ucla <- c("sex female", "age", "starting", "concentration", "race white")
-covars_uq   <- c("sex female", "age", "starting", "concentration")
+covars_ucla <- c("Sex_Male", "age", "input_cfdna", "concentration")
+covars_uq   <- c("Sex_Male", "age", "input_cfdna", "concentration")
 
 # ------------------------ Helpers -------------------------
 
 read_meth_as_samples <- function(path) {
   df <- fread(path, data.table = FALSE)
-  if (!is.numeric(df[[1]])) df <- df[, -1, drop = FALSE]  # drop CpG index column if present
-  as.data.frame(t(df))                                    # rows = samples, cols = CpGs
+  if (!is.numeric(df[[1]])) df <- df[, -1, drop = FALSE]
+  as.data.frame(t(df))
 }
 
 to_binary01 <- function(x) {
@@ -52,13 +52,7 @@ report_auc <- function(y, score, label) {
   a
 }
 
-reduce_covariates <- function(C_train) {
-  if (is.null(C_train) || ncol(C_train) == 0) return(list(C = NULL, idx = integer(0)))
-  keep <- which(apply(C_train, 2, function(v) length(unique(v)) > 1))
-  if (length(keep) == 0) return(list(C = NULL, idx = integer(0)))
-  list(C = C_train[, keep, drop = FALSE], idx = keep)
-}
-
+# Build a cohort dataset (X_meth, C_cov, y, ids)
 build_cohort <- function(cohort, meth_path, cov_df, meta_df, covars_keep) {
   md <- meta_df %>%
     filter(group == cohort) %>%
@@ -67,6 +61,7 @@ build_cohort <- function(cohort, meth_path, cov_df, meta_df, covars_keep) {
 
   X <- read_meth_as_samples(meth_path)
 
+  # Rename if rownames are V1..Vn
   if (all(grepl("^V[0-9]+$", rownames(X)))) {
     rn <- as.character(cov_df$sample_num)
     n  <- min(nrow(X), length(rn))
@@ -87,28 +82,31 @@ build_cohort <- function(cohort, meth_path, cov_df, meta_df, covars_keep) {
   list(X = X, C = C, y = y, ids = keep_ids)
 }
 
-xcohort_auc <- function(train, test, label, alphas = c(1e-4, 0.01, 0.1, 0.5)) {
+# Cross-cohort evaluation
+xcohort_auc <- function(train, test, label, alphas = c(1e-4)) {
   scaled <- minmax_scale(train$X, test$X)
-
-  red <- reduce_covariates(train$C)
-  Ctr <- red$C
-  Cte <- if (length(red$idx)) test$C[, red$idx, drop = FALSE] else NULL
+  Ctr <- train$C
+  Cte <- test$C
 
   fit <- big_spLogReg(
     X = safe_FBM(scaled$train),
     y01.train = train$y,
     alphas = alphas,
-    covar.train = if (!is.null(Ctr)) data.matrix(Ctr) else NULL,
+    covar.train = if (ncol(Ctr) > 0) data.matrix(Ctr) else NULL,
     warn = FALSE
   )
 
-  preds <- predict(fit, safe_FBM(scaled$test),
-                   covar.row = if (!is.null(Cte)) data.matrix(Cte) else NULL)
+  preds <- predict(
+    fit,
+    safe_FBM(scaled$test),
+    covar.row = if (ncol(Cte) > 0) data.matrix(Cte) else NULL
+  )
 
   report_auc(test$y, preds, label)
 }
 
-within_cv_auc <- function(dat, label, k = 10, seed = 1, alphas = c(1e-4, 0.01, 0.1, 0.5)) {
+# Within-cohort cross-validation
+within_cv_auc <- function(dat, label, k = 10, seed = 1, alphas = c(1e-4)) {
   set.seed(seed)
   folds <- createFolds(dat$y, k = k, list = TRUE)
   pred <- rep(NA_real_, length(dat$y))
@@ -118,32 +116,31 @@ within_cv_auc <- function(dat, label, k = 10, seed = 1, alphas = c(1e-4, 0.01, 0
     idx_tr <- setdiff(seq_along(dat$y), idx_te)
 
     scaled <- minmax_scale(dat$X[idx_tr, , drop = FALSE],
-                           dat$X[idx_te, , drop = FALSE])
-
-    red <- reduce_covariates(dat$C[idx_tr, , drop = FALSE])
-    Ctr <- red$C
-    Cte <- if (length(red$idx)) dat$C[idx_te, red$idx, drop = FALSE] else NULL
+                           dat$X[idx_te,  , drop = FALSE])
+    Ctr <- dat$C[idx_tr, , drop = FALSE]
+    Cte <- dat$C[idx_te, , drop = FALSE]
 
     fit <- big_spLogReg(
       X = safe_FBM(scaled$train),
       y01.train = dat$y[idx_tr],
       alphas = alphas,
-      covar.train = if (!is.null(Ctr)) data.matrix(Ctr) else NULL,
+      covar.train = if (ncol(Ctr) > 0) data.matrix(Ctr) else NULL,
       warn = FALSE
     )
 
     pred[idx_te] <- predict(
       fit,
       safe_FBM(scaled$test),
-      covar.row = if (!is.null(Cte)) data.matrix(Cte) else NULL
+      covar.row = if (ncol(Cte) > 0) data.matrix(Cte) else NULL
     )
   }
 
   report_auc(dat$y, pred, label)
 }
 
+# Combined 10-fold CV
 combined_cv_auc <- function(ucla, uq, label = "Combined (CV)", k = 10, seed = 1,
-                            alphas = c(1e-4, 0.01, 0.1, 0.5)) {
+                            alphas = c(1e-4)) {
   X <- rbind(ucla$X, uq$X)
   C <- rbind(ucla$C, uq$C)
   y <- c(ucla$y, uq$y)
@@ -158,23 +155,21 @@ combined_cv_auc <- function(ucla, uq, label = "Combined (CV)", k = 10, seed = 1,
 
     scaled <- minmax_scale(X[idx_tr, , drop = FALSE],
                            X[idx_te, , drop = FALSE])
-
-    red <- reduce_covariates(C[idx_tr, , drop = FALSE])
-    Ctr <- red$C
-    Cte <- if (length(red$idx)) C[idx_te, red$idx, drop = FALSE] else NULL
+    Ctr <- C[idx_tr, , drop = FALSE]
+    Cte <- C[idx_te, , drop = FALSE]
 
     fit <- big_spLogReg(
       X = safe_FBM(scaled$train),
       y01.train = y[idx_tr],
       alphas = alphas,
-      covar.train = if (!is.null(Ctr)) data.matrix(Ctr) else NULL,
+      covar.train = if (ncol(Ctr) > 0) data.matrix(Ctr) else NULL,
       warn = FALSE
     )
 
     pred[idx_te] <- predict(
       fit,
       safe_FBM(scaled$test),
-      covar.row = if (!is.null(Cte)) data.matrix(Cte) else NULL
+      covar.row = if (ncol(Cte) > 0) data.matrix(Cte) else NULL
     )
   }
 
